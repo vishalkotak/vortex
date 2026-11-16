@@ -3,11 +3,12 @@
 
 //! Decimal compute on DecimalByteParts arrays whose MSP holds the whole value.
 //!
-//! Every case has no lower parts. Most cases store the values in an MSP narrower than the
-//! canonical width of the dtype, and `msp_i64_p18_canonical` is the control whose MSP has the
-//! canonical width. Decode and filter end at a decimal array at the canonical width of its dtype,
-//! copying only when decoding returns a narrower array. This keeps their results comparable when
-//! the decoder changes its output width. Aggregates and comparisons run on the MSP where supported.
+//! Every case has no lower parts. Most cases store the values in a child narrower than the logical
+//! `i64` MSP, under a `Widen` MSP. `msp_i64_p38` stores a plain `i64` MSP under an `i128` dtype,
+//! and `msp_i64_p18_canonical` is the control whose MSP has the canonical width. Decode and filter
+//! end at a decimal array at the canonical width of its dtype, copying only when decoding returns
+//! a narrower array. This keeps their results comparable when the decoder changes its output width.
+//! Aggregates and comparisons run on the MSP where supported.
 
 use std::fmt;
 use std::sync::LazyLock;
@@ -30,8 +31,10 @@ use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::WidenArray;
 use vortex_array::arrays::decimal::copy_to_canonical_width;
 use vortex_array::builtins::ArrayBuiltins;
+use vortex_array::dtype::DType;
 use vortex_array::dtype::DecimalDType;
 use vortex_array::dtype::NativePType;
 use vortex_array::dtype::Nullability;
@@ -152,12 +155,12 @@ impl Case {
         }
     }
 
-    /// A constant above every value that the MSP can hold, for the cases where the DBP compare
-    /// kernel answers without reading values.
+    /// A constant above every value that the stored values can hold, for the cases where a compare
+    /// kernel answers without reading values: the `Widen` kernel for a narrow child, or the DBP
+    /// kernel for `msp_i64_p38`.
     ///
-    /// The kernel answers this way only when every row is valid, so the nullable case has no
-    /// such constant. Every `Decimal(18, _)` value fits an `i64`, so the canonical case has none
-    /// either.
+    /// The nullable case is not measured here. Every `Decimal(18, _)` value fits an `i64`, so the
+    /// canonical case has no such constant.
     fn constant_above_msp_range(self) -> Option<DecimalValue> {
         match self {
             Self::MspI32P18 => Some(DecimalValue::I64(i64::from(i32::MAX) + 1)),
@@ -219,10 +222,23 @@ impl Input {
             .msp_validity
             .clone()
             .map_or(Validity::NonNullable, Validity::from);
-        let msp =
-            PrimitiveArray::from_byte_buffer(self.msp_values.clone(), self.msp_ptype, validity);
-        let array = DecimalByteParts::try_new(msp.into_array(), self.decimal_dtype)
-            .vortex_expect("the MSP of every benchmark input is a signed integer array")
+        let msp = PrimitiveArray::from_byte_buffer(
+            self.msp_values.clone(),
+            self.msp_ptype,
+            validity.clone(),
+        );
+        let msp = if self.msp_ptype.byte_width() < PType::I64.byte_width() {
+            WidenArray::try_new(
+                msp.into_array(),
+                DType::Primitive(PType::I64, validity.nullability()),
+            )
+            .vortex_expect("benchmark MSP must be narrower than its logical dtype")
+            .into_array()
+        } else {
+            msp.into_array()
+        };
+        let array = DecimalByteParts::try_new(msp, self.decimal_dtype)
+            .vortex_expect("every benchmark MSP has the logical MSP dtype of its precision")
             .into_array();
         mark_optimized(&array, &SESSION).vortex_expect("mark the benchmark input as optimized");
 
