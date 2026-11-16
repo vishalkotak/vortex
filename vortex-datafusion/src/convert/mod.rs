@@ -17,7 +17,6 @@ pub(crate) mod schema;
 pub(crate) mod stats;
 
 pub use exprs::DefaultExpressionConverter;
-pub use exprs::ExpressionConstructor;
 pub use exprs::ExpressionConverter;
 pub use exprs::NodeConversion;
 pub use exprs::ProcessedProjection;

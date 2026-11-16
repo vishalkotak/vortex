@@ -42,12 +42,23 @@ use datafusion_common::arrow::buffer::OffsetBuffer;
 use datafusion_common::arrow::compute::cast;
 use datafusion_common::arrow::datatypes::i256 as arrow_i256;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_expr::HigherOrderUDF;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_expr::ScalarUDF;
 use datafusion_functions::core::coalesce::CoalesceFunc;
+use datafusion_functions::core::getfield::GetFieldFunc;
+use datafusion_functions::string::contains::ContainsFunc;
+use datafusion_functions::string::ends_with::EndsWithFunc;
+use datafusion_functions::string::lower::LowerFunc;
+use datafusion_functions::string::octet_length::OctetLengthFunc;
+use datafusion_functions::string::starts_with::StartsWithFunc;
+use datafusion_functions::unicode::strpos::StrposFunc;
+use datafusion_functions_nested::array_sum::ArraySum;
+use datafusion_functions_nested::length::ArrayLength;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_plan::expressions as df_expr;
@@ -55,6 +66,7 @@ use insta::assert_snapshot;
 use rstest::rstest;
 use vortex::array::Canonical;
 use vortex::array::IntoArray;
+use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::BoolArray;
 use vortex::array::arrays::ConstantArray;
 use vortex::array::arrays::PrimitiveArray;
@@ -62,16 +74,27 @@ use vortex::array::builtins::ArrayBuiltins;
 use vortex::dtype::PType;
 use vortex::encodings::uuid::Uuid;
 use vortex::expr::between;
+use vortex::expr::is_null;
+use vortex::expr::lit;
+use vortex::expr::nested_case_when;
+use vortex::expr::not;
 use vortex::expr::proto::ExprSerializeProtoExt;
 use vortex::scalar::Scalar;
+use vortex::scalar_fn::ScalarFnVTableExt;
 use vortex::scalar_fn::fns::between::BetweenOptions;
 use vortex::scalar_fn::fns::between::StrictComparison;
+use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::cast::Cast;
+use vortex::scalar_fn::fns::like::Like;
+use vortex::scalar_fn::fns::like::LikeOptions;
 use vortex::scalar_fn::fns::list_contains::ListContains;
 use vortex::scalar_fn::fns::literal::Literal;
+use vortex::scalar_fn::fns::operators::Operator;
 use vortex_array::assert_arrays_eq;
 
 use super::*;
+use super::convertible::supported_data_types;
+use super::convertible::try_operator_from_df;
 use crate::common_tests::TestSessionContext;
 use crate::convert::TryToDataFusion;
 
@@ -2802,7 +2825,7 @@ fn convert_with_custom_coalesce(
             };
             children.push(child);
         }
-        return (node.construct)(children);
+        return node.construct(children);
     }
     if let Some(scalar_fn) = expr.downcast_ref::<ScalarFunctionExpr>()
         && ScalarFunctionExpr::try_downcast_func::<CoalesceFunc>(scalar_fn).is_some()
@@ -2892,7 +2915,7 @@ fn test_one_step_selects_function_inputs(#[values(false, true)] length: bool) ->
     assert_eq!(node.children.len(), 1);
     assert!(Arc::ptr_eq(node.children[0], &source));
     assert_eq!(
-        (node.construct)(vec![get_item("a", root())])?,
+        node.construct(vec![get_item("a", root())])?,
         converter.try_convert(&expr, &schema)?
     );
     Ok(())
@@ -2923,7 +2946,7 @@ fn test_one_step_deduplicates_in_list_before_traversal() -> anyhow::Result<()> {
         .map(|child| convert(Arc::clone(child), &schema))
         .collect::<DFResult<Vec<_>>>()?;
     assert_eq!(
-        (node.construct)(converted)?,
+        node.construct(converted)?,
         converter.try_convert(&expr, &schema)?
     );
     Ok(())
@@ -2946,7 +2969,7 @@ fn test_one_step_constructor_declines_fallible_children(
     let node = try_convert_node(&expr, &schema, &session)?
         .ok_or_else(|| exec_datafusion_err!("Expected boolean conversion"))?;
     let fallible = is_null(Binary.new_expr(Operator::Div, [lit(1i32), lit(0i32)]));
-    assert!((node.construct)(vec![get_item("a", root()), fallible])?.is_none());
+    assert!(node.construct(vec![get_item("a", root()), fallible])?.is_none());
     Ok(())
 }
 
@@ -2959,7 +2982,7 @@ fn test_one_step_constructor_rejects_wrong_arity(#[values(0, 2)] arity: usize) -
     let schema = Schema::empty();
     let node = try_convert_node(&expr, &schema, &session)?
         .ok_or_else(|| exec_datafusion_err!("Expected NOT conversion"))?;
-    let error = (node.construct)(vec![lit(true); arity]).unwrap_err();
+    let error = node.construct(vec![lit(true); arity]).unwrap_err();
     assert!(error.to_string().contains("Expected 1 converted children"));
     Ok(())
 }
@@ -2990,7 +3013,7 @@ fn test_one_step_case_child_order(#[values(false, true)] with_else: bool) -> any
         converted.push(lit(2i32));
     }
     assert_eq!(
-        (node.construct)(converted)?,
+        node.construct(converted)?,
         Some(nested_case_when(
             vec![(lit(false), lit(1i32))],
             with_else.then(|| lit(2i32)),
